@@ -7,20 +7,7 @@ import type { ProviderMessageRecord } from "@spectrum-ts/core/authoring";
 import { unsupportedLocalContent } from "../../../imessage/src/shared/errors";
 import { vcardFileName } from "../../../imessage/src/shared/vcard";
 import { DEFAULT_ATTACHMENT_NAME } from "./attachments";
-
-// v3 `IMessageSDK.send` resolves to `void`: the chat.db row id only
-// surfaces later via the watcher's `onFromMeMessage`. A synthetic id keeps
-// the platform contract intact; iMessage local does not implement
-// `editMessage`, so the id is never resolved back to a real row.
-const synthRecord = (
-  spaceId: string,
-  content: Content
-): ProviderMessageRecord => ({
-  id: crypto.randomUUID(),
-  content,
-  space: { id: spaceId },
-  timestamp: new Date(),
-});
+import { sendWithCorrelation } from "./outbound";
 
 const sendTempFile = async (
   client: IMessageSDK,
@@ -46,20 +33,40 @@ export const send = async (
 ): Promise<ProviderMessageRecord> => {
   switch (content.type) {
     case "text":
-      await client.send({ to: spaceId, text: content.text });
-      return synthRecord(spaceId, content);
-    case "attachment":
-      await sendTempFile(client, spaceId, content.name, await content.read());
-      return synthRecord(spaceId, content);
-    case "contact": {
-      const vcf = await toVCard(content);
-      await sendTempFile(
+      return sendWithCorrelation(
         client,
         spaceId,
-        vcardFileName(content),
-        Buffer.from(vcf, "utf8")
+        content,
+        (message) => message.text === content.text,
+        () => client.send({ to: spaceId, text: content.text })
       );
-      return synthRecord(spaceId, content);
+    case "attachment": {
+      const safeName = basename(content.name) || DEFAULT_ATTACHMENT_NAME;
+      return sendWithCorrelation(
+        client,
+        spaceId,
+        content,
+        (message) =>
+          message.attachments.some(
+            (attachment) => attachment.fileName === safeName
+          ),
+        async () =>
+          sendTempFile(client, spaceId, safeName, await content.read())
+      );
+    }
+    case "contact": {
+      const vcf = await toVCard(content);
+      const name = vcardFileName(content);
+      return sendWithCorrelation(
+        client,
+        spaceId,
+        content,
+        (message) =>
+          message.attachments.some(
+            (attachment) => attachment.fileName === name
+          ),
+        () => sendTempFile(client, spaceId, name, Buffer.from(vcf, "utf8"))
+      );
     }
     case "effect":
       throw unsupportedLocalContent(
